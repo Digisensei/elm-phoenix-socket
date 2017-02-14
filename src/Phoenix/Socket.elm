@@ -1,4 +1,4 @@
-module Phoenix.Socket exposing (Socket, Msg, init, update, withDebug, join, leave, push, on, off, listen, withoutHeartbeat, withHeartbeatInterval)
+module Phoenix.Socket exposing (Socket, Msg, init, update, withDebug, join, leave, push, on, off, listen, withoutHeartbeat, withHeartbeatInterval, withAutoReconnection, config_reconnection, defaultReconnectSec, reJoinAllpreviousChannels)
 
 {-|
 
@@ -11,20 +11,44 @@ module Phoenix.Socket exposing (Socket, Msg, init, update, withDebug, join, leav
 # Events
 @docs on, off
 
+
 # Sending messages
 @docs push
+
+# Auto Reconnection timer
+@docs withAutoReconnection, config_reconnection, defaultReconnectSec, reJoinAllpreviousChannels
 
 -}
 
 import Phoenix.Channel as Channel exposing (Channel, setState)
 import Phoenix.Push as Push exposing (Push)
 import Phoenix.Helpers exposing (Message, messageDecoder, encodeMessage, emptyPayload)
+
+
+-- import Phoenix.ConnectionHelper as ConHelper exposing (cfg)
+
 import Dict exposing (Dict)
 import WebSocket
 import Json.Encode as JE
 import Json.Decode as JD exposing (field)
 import Maybe exposing (andThen)
 import Time exposing (Time, every, second)
+import Array exposing (Array, set, get, length)
+import Task exposing (Task, perform, succeed)
+
+
+{-| -}
+type Msg msg
+    = NoOp
+    | ExternalMsg msg
+    | ChannelErrored String
+    | ChannelClosed String
+    | ChannelJoined String
+    | ReceiveReply String Int
+    | Heartbeat Time
+    | ScheduleTimeout Time
+    | RemainingJoins Int
+    | RemoveSendedPush Int
 
 
 {-| Stores channels, event handlers, and configuration options
@@ -38,18 +62,13 @@ type alias Socket msg =
     , ref : Int
     , heartbeatIntervalSeconds : Float
     , withoutHeartbeat : Bool
+    , withoutAutoReconnect : Bool
+    , autoReconnectAfterSec : Int
+    , autoReconnectTimer : Int
+    , reconnectChannel : Maybe String
+    , reconnectOrderMandatory : Array String
+    , reconnectFirstsTo : Int
     }
-
-
-{-| -}
-type Msg msg
-    = NoOp
-    | ExternalMsg msg
-    | ChannelErrored String
-    | ChannelClosed String
-    | ChannelJoined String
-    | ReceiveReply String Int
-    | Heartbeat Time
 
 
 {-| Initializes a `Socket` with the given path
@@ -64,13 +83,107 @@ init path =
     , ref = 0
     , heartbeatIntervalSeconds = 30
     , withoutHeartbeat = False
+    , withoutAutoReconnect = True
+    , autoReconnectAfterSec = defaultReconnectSec
+    , autoReconnectTimer = 0
+    , reconnectChannel = Nothing
+    , reconnectOrderMandatory = Array.empty
+    , reconnectFirstsTo = 0
     }
+
+
+{-|
+  Default time for autoReconnect
+
+-}
+defaultReconnectSec : Int
+defaultReconnectSec =
+    30
+
+
+{-|
+  force_reconnect socket
+
+  force reconnect in case of inactivity from user.
+-}
+force_reconnect : Int -> Socket msg -> ( Socket msg, Cmd (Msg msg) )
+force_reconnect totalRemainigJoins socket =
+    case Array.get (Array.length socket.reconnectOrderMandatory - totalRemainigJoins) socket.reconnectOrderMandatory of
+        Just channelName ->
+            case Dict.get channelName socket.channels of
+                Just channel ->
+                    forceJoinChannel channel socket (Task.perform RemainingJoins (Task.succeed (totalRemainigJoins - 1)))
+
+                Nothing ->
+                    ( socket, Cmd.none )
+
+        Nothing ->
+            ( socket, Cmd.none )
+
+
+reconnectOnlyCurrentChannel : Int
+reconnectOnlyCurrentChannel =
+    0
+
+
+{-|
+  Configure reconnection settings
+    reconnectFirstsTo
+-}
+config_reconnection : Int -> Int -> Socket msg -> Socket msg
+config_reconnection reconnectFirstsTo autoReconSec socket =
+    let
+        recFirstsStateCounter =
+            if reconnectFirstsTo == reconnectOnlyCurrentChannel then
+                reconnectFirstsTo
+            else
+                reconnectFirstsTo
+    in
+        { socket | reconnectFirstsTo = recFirstsStateCounter, autoReconnectAfterSec = autoReconSec, withoutAutoReconnect = False }
+
+
+{-|
+  Activate auto reconnection with default parameters
+-}
+withAutoReconnection : Socket msg -> Socket msg
+withAutoReconnection socket =
+    { socket | withoutAutoReconnect = False }
+
+
+{-|
+-}
+reJoinAllpreviousChannels : Socket msg -> ( Socket msg, Cmd (Msg msg) )
+reJoinAllpreviousChannels socket =
+    if socket.withoutAutoReconnect then
+        ( socket, Cmd.none )
+    else
+        force_reconnect (Array.length socket.reconnectOrderMandatory) socket
 
 
 {-| -}
 update : Msg msg -> Socket msg -> ( Socket msg, Cmd (Msg msg) )
 update msg socket =
     case msg of
+        RemainingJoins totalRemainigJoins ->
+            force_reconnect totalRemainigJoins socket
+
+        ScheduleTimeout _ ->
+            let
+                cal =
+                    (socket.autoReconnectTimer + 1)
+            in
+                if (cal >= (socket.autoReconnectAfterSec // 5)) then
+                    let
+                        totalRemainigJoins =
+                            Array.length socket.reconnectOrderMandatory
+
+                        task =
+                            Task.perform RemainingJoins (Task.succeed (totalRemainigJoins))
+                    in
+                        ( { socket | autoReconnectTimer = 0 }, task )
+                else
+                    ( { socket | autoReconnectTimer = cal }, Cmd.none )
+
         ChannelErrored channelName ->
             let
                 channels =
@@ -92,7 +205,7 @@ update msg socket =
                             Dict.remove channel.joinRef socket.pushes
 
                         socket_ =
-                            { socket | channels = channels, pushes = pushes }
+                            { socket | channels = channels, pushes = pushes, autoReconnectTimer = 0 }
                     in
                         ( socket_, Cmd.none )
 
@@ -106,11 +219,14 @@ update msg socket =
                         channels =
                             Dict.insert channelName (setState Channel.Joined channel) socket.channels
 
+                        stateRec =
+                            socket.reconnectFirstsTo
+
                         pushes =
                             Dict.remove channel.joinRef socket.pushes
 
                         socket_ =
-                            { socket | channels = channels, pushes = pushes }
+                            { socket | reconnectOrderMandatory = (add_autoReconnectList channelName socket), channels = channels, pushes = pushes }
                     in
                         ( socket_, Cmd.none )
 
@@ -120,8 +236,33 @@ update msg socket =
         Heartbeat _ ->
             heartbeat socket
 
+        RemoveSendedPush ref ->
+            ( { socket | pushes = Dict.remove ref socket.pushes }, Cmd.none )
+
         _ ->
             ( socket, Cmd.none )
+
+
+add_autoReconnectList : String -> Socket msg -> Array String
+add_autoReconnectList channelName socket =
+    let
+        stateRec =
+            socket.reconnectFirstsTo
+
+        sizeOfArray =
+            (Array.length socket.reconnectOrderMandatory)
+    in
+        if stateRec == reconnectOnlyCurrentChannel then
+            if Array.isEmpty socket.reconnectOrderMandatory then
+                Array.push channelName socket.reconnectOrderMandatory
+            else
+                Array.set reconnectOnlyCurrentChannel channelName socket.reconnectOrderMandatory
+        else if sizeOfArray < stateRec then
+            Array.push channelName socket.reconnectOrderMandatory
+        else if sizeOfArray == stateRec then
+            Array.push channelName socket.reconnectOrderMandatory
+        else
+            Array.set (sizeOfArray - 1) channelName socket.reconnectOrderMandatory
 
 
 {-| When enabled, prints all incoming Phoenix messages to the console
@@ -151,7 +292,8 @@ withoutHeartbeat socket =
 
     payload = Json.Encode.object [ ("user_id", Json.Encode.string "123") ]
     channel = Channel.init "rooms:lobby" |> Channel.withPayload payload
-    (socket_, cmd) = join channel socket
+    (socket_, cmd) =
+      join channel socket
 
 -}
 join : Channel msg -> Socket msg -> ( Socket msg, Cmd (Msg msg) )
@@ -165,6 +307,18 @@ join channel socket =
 
         Nothing ->
             joinChannel channel socket
+
+
+forceJoinChannel : Channel msg -> Socket msg -> Cmd (Msg msg) -> ( Socket msg, Cmd (Msg msg) )
+forceJoinChannel channel socket cmd =
+    let
+        push_ =
+            Push "phx_join" channel.name channel.payload channel.onJoin channel.onError
+
+        channel_ =
+            { channel | state = Channel.Joining, joinRef = socket.ref }
+    in
+        forcePush push_ socket cmd
 
 
 joinChannel : Channel msg -> Socket msg -> ( Socket msg, Cmd (Msg msg) )
@@ -204,7 +358,9 @@ leave channelName socket =
                     socket_ =
                         { socket | channels = Dict.insert channelName channel_ socket.channels }
                 in
-                    push push_ socket_
+                    pushWithoutBufferingPayload push_ socket_
+                -- push push_ socket_
+                -- check if need to buffering push messages
             else
                 ( socket, Cmd.none )
 
@@ -218,7 +374,33 @@ heartbeat socket =
         push_ =
             Push.init "heartbeat" "phoenix"
     in
-        push push_ socket
+        --push push_ socket
+        sendHeatbeat push_ socket
+
+
+{-| sendHeatbeat
+
+   send heartbeat and not add to push messages
+
+-}
+sendHeatbeat : Push msg -> Socket msg -> ( Socket msg, Cmd (Msg msg) )
+sendHeatbeat push_ socket =
+    ( socket, send socket push_.event push_.channel push_.payload )
+
+
+pushWithoutBufferingPayload : Push msg -> Socket msg -> ( Socket msg, Cmd (Msg msg) )
+pushWithoutBufferingPayload push_ socket =
+    ( socket, send socket push_.event push_.channel push_.payload )
+
+
+forcePush : Push msg -> Socket msg -> Cmd (Msg msg) -> ( Socket msg, Cmd (Msg msg) )
+forcePush push_ socket cmd =
+    ( socket
+    , Cmd.batch
+        [ send socket push_.event push_.channel push_.payload
+        , cmd
+        ]
+    )
 
 
 {-| Pushes a message
@@ -232,6 +414,7 @@ push push_ socket =
     ( { socket
         | pushes = Dict.insert socket.ref push_ socket.pushes
         , ref = socket.ref + 1
+        , autoReconnectTimer = 0
       }
     , send socket push_.event push_.channel push_.payload
     )
@@ -287,7 +470,29 @@ listen socket fn =
         [ internalMsgs socket
         , externalMsgs socket
         , heartbeatSubscription socket
+        , scheduleTimeout socket
         ]
+
+
+{-|
+  scheduleTimeout timer for auto reconnect
+-}
+scheduleTimeout : Socket msg -> Sub (Msg msg)
+scheduleTimeout socket =
+    if socket.withoutAutoReconnect then
+        Sub.none
+    else
+        -- check intervals of 5 seconds
+        Time.every (Time.second * 5) ScheduleTimeout
+
+
+withoutAutoReconnect : Socket msg -> Socket msg
+withoutAutoReconnect socket =
+    { socket | withoutAutoReconnect = True }
+
+
+
+-- auto reconnect
 
 
 mapAll : (Msg msg -> msg) -> Msg msg -> msg
@@ -378,7 +583,7 @@ handleInternalPhxReply socket message =
                                                     else if ref == channel.leaveRef then
                                                         Just (ChannelClosed message.topic)
                                                     else
-                                                        Nothing
+                                                        Just (RemoveSendedPush ref)
                                                 else
                                                     Nothing
                                             )
