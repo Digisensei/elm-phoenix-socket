@@ -84,7 +84,7 @@ but you need to add some boilerplate to your project to wire everything up.
         -- the module check in intervals of 5 seconds until comming to 300 seconds if dectect activity from user this time is cleared and count again
     ```
 
-  8. Force reconnection after device sleep
+8. Force reconnection after device sleep
 
     ```js
       // interop
