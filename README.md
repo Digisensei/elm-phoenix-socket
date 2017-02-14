@@ -72,6 +72,69 @@ but you need to add some boilerplate to your project to wire everything up.
       Phoenix.Socket.listen model.phxSocket PhoenixMsg
     ```
 
+7. Auto reconnect configuration
+
+    ```elm
+    phxSocket =
+        |> Phoenix.Socket.init server
+        |> Phoenix.Socket.withAutoReconnection
+        |> Phoenix.Socket.config_reconnection 2 300
+        -- set config_reconnection {first 2 channels (ex Lobby, user) mandatory for reconnection state by order } {300 seconds}
+        -- reconnect this 2 channels and the change only last one for example {current conversation channel }
+        -- the module check in intervals of 5 seconds until comming to 300 seconds if dectect activity from user this time is cleared and count again
+    ```
+
+  8. Force reconnection after device sleep
+
+    ```js
+      // interop
+      var myWorker = new Worker("/interop/DetectWakeup.js");
+
+      myWorker.onmessage = function (ev) {
+        if (ev && ev.data === 'wakeup') {
+           // send signal to wake up
+          app.ports.reJoinAllpreviousChannels.send("wakeup");
+        }
+      }
+
+      // file DectectWakeup.js
+
+        var lastTime = (new Date()).getTime();
+        var checkInterval = 5000;
+
+        setInterval(function () {
+          var currentTime = (new Date()).getTime();
+
+          if (currentTime > (lastTime + checkInterval * 2)) {  // ignore small delays errors
+              postMessage("wakeup");
+          }
+          lastTime = currentTime;
+        }, checkInterval);
+    ```
+
+    ```elm
+    {-
+      ports to wakeup connection on phoenix
+    -}
+    port reJoinAllpreviousChannels : (String -> msg) -> Sub msg
+
+      ReJoinPrev str ->
+            if String.contains str "wakeup" then
+                let
+                    ( phxSocket_, phxCmd ) =
+                        Phoenix.Socket.reJoinAllpreviousChannels model.phxSocket
+                in
+                    ( { model | phxSocket = phxSocket_ }, Cmd.map PhoenixMsg phxCmd )
+            else
+                ( model, Cmd.none )
+
+
+    -- subscriptions
+    -- add
+          PhxHelpers.reJoinAllpreviousChannels ReJoinPrev
+    ```
+
+
 Take a look at examples/Chat.elm if you want to see an example.
 
 ## Contributing
@@ -82,12 +145,15 @@ this library after the official javascript one, but that may not be the best app
 
 ## Change log
 
-### v2.0.0
+### v2.0.2
 
-- Client sends a heartbeat every 30 seconds (by default) to ensure that the connection stays healthy
-- The heartbeat can be turned off or set to a different interval
+- Combine Heatbeat with auto reconnection for life time on client  
+- Force previus connection sequence by wakeup script JS via ports using a  difer from date time and interval old date time.
+- fix erros for buffering heatbeat pushes, and remove from buffer all "ref" on payloads sended to server and received.
 
 ## To do:
 
+- Change script wakeup via port to Elm
+- Change timeout code for auto reconnect to Task
 - If a channel errors out, automatically reconnect with an exponential backoff strategy
 - Write tests
